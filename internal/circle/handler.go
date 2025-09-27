@@ -6,11 +6,13 @@ import (
 	"strconv"
 	"time"
 
-	auth "donetick.com/core/internal/authorization"
+	"donetick.com/core/config"
+	auth "donetick.com/core/internal/auth"
 	"donetick.com/core/internal/chore"
 	chRepo "donetick.com/core/internal/chore/repo"
 	cModel "donetick.com/core/internal/circle/model"
 	cRepo "donetick.com/core/internal/circle/repo"
+	pRepo "donetick.com/core/internal/points/repo"
 	uModel "donetick.com/core/internal/user/model"
 	uRepo "donetick.com/core/internal/user/repo"
 	"donetick.com/core/logging"
@@ -19,16 +21,25 @@ import (
 )
 
 type Handler struct {
-	circleRepo *cRepo.CircleRepository
-	userRepo   *uRepo.UserRepository
-	choreRepo  *chRepo.ChoreRepository
+	circleRepo           *cRepo.CircleRepository
+	userRepo             *uRepo.UserRepository
+	choreRepo            *chRepo.ChoreRepository
+	pointRepo            *pRepo.PointsRepository
+	isDonetickDotCom     bool
+	maxCircleMembers     int
+	plusMaxCircleMembers int
 }
 
-func NewHandler(cr *cRepo.CircleRepository, ur *uRepo.UserRepository, c *chRepo.ChoreRepository) *Handler {
+func NewHandler(cr *cRepo.CircleRepository, ur *uRepo.UserRepository, c *chRepo.ChoreRepository, pr *pRepo.PointsRepository,
+	config *config.Config) *Handler {
 	return &Handler{
-		circleRepo: cr,
-		userRepo:   ur,
-		choreRepo:  c,
+		circleRepo:           cr,
+		userRepo:             ur,
+		choreRepo:            c,
+		pointRepo:            pr,
+		isDonetickDotCom:     config.IsDoneTickDotCom,
+		maxCircleMembers:     config.FeatureLimits.MaxCircleMembers,
+		plusMaxCircleMembers: config.FeatureLimits.PlusCircleMaxMembers,
 	}
 }
 
@@ -88,7 +99,6 @@ func (h *Handler) JoinCircle(c *gin.Context) {
 		})
 		return
 	}
-
 	// Add the user to the circle
 	err = h.circleRepo.AddUserToCircle(c, &cModel.UserCircle{
 		CircleID: circle.ID,
@@ -140,7 +150,7 @@ func (h *Handler) LeaveCircle(c *gin.Context) {
 
 	// START : HANDLE USER LEAVING CIRCLE
 	// bulk update chores:
-	if err := handleUserLeavingCircle(h, c, currentUser, orginalCircleID); err != nil {
+	if err := handleUserLeavingCircle(h, c, &currentUser.User, orginalCircleID); err != nil {
 		log.Error("Error handling user leaving circle:", err)
 		c.JSON(500, gin.H{
 			"error": "Error handling user leaving circle",
@@ -172,7 +182,7 @@ func (h *Handler) LeaveCircle(c *gin.Context) {
 }
 
 func handleUserLeavingCircle(h *Handler, c *gin.Context, leavingUser *uModel.User, orginalCircleID int) error {
-	userAssignedCircleChores, err := h.choreRepo.GetChores(c, leavingUser.CircleID, leavingUser.ID)
+	userAssignedCircleChores, err := h.choreRepo.GetChores(c, leavingUser.CircleID, leavingUser.ID, true)
 	if err != nil {
 		return err
 	}
@@ -355,7 +365,14 @@ func (h *Handler) AcceptJoinRequest(c *gin.Context) {
 		return
 	}
 
-	currentMemebers, err := h.circleRepo.GetCircleUsers(c, currentUser.CircleID)
+	currentMembers, err := h.circleRepo.GetCircleUsers(c, currentUser.CircleID)
+	// filter to the active members only:
+	activeMembers := make([]*cModel.UserCircleDetail, 0)
+	for _, member := range currentMembers {
+		if member.IsActive {
+			activeMembers = append(activeMembers, member)
+		}
+	}
 	if err != nil {
 		log.Error("Error getting circle members:", err)
 		c.JSON(500, gin.H{
@@ -363,10 +380,22 @@ func (h *Handler) AcceptJoinRequest(c *gin.Context) {
 		})
 		return
 	}
-
+	if h.isDonetickDotCom {
+		maxMembers := h.maxCircleMembers
+		if currentUser.IsPlusMember() {
+			maxMembers = h.plusMaxCircleMembers
+		}
+		if len(activeMembers) >= maxMembers {
+			log.Error("Circle is full")
+			c.JSON(400, gin.H{
+				"error": "Circle is full, you can only have " + strconv.Itoa(maxMembers) + " members in a circle",
+			})
+			return
+		}
+	}
 	// confirm that the current user is an admin:
 	isAdmin := false
-	for _, member := range currentMemebers {
+	for _, member := range currentMembers {
 		if member.UserID == currentUser.ID && member.Role == "admin" {
 			isAdmin = true
 			break
@@ -422,21 +451,208 @@ func (h *Handler) AcceptJoinRequest(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"res": "Join request accepted successfully",
 	})
+
+}
+func (h *Handler) RedeemPoints(c *gin.Context) {
+	type RedeemPointsRequest struct {
+		Points int `json:"points"`
+		UserID int `json:"userId"`
+	}
+
+	log := logging.FromContext(c)
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(500, gin.H{
+			"error": "Error getting current user",
+		})
+		return
+	}
+	// parse body:
+	var redeemReq RedeemPointsRequest
+
+	if err := c.ShouldBind(&redeemReq); err != nil {
+		c.JSON(400, gin.H{
+			"error": "Invalid request",
+		})
+		return
+
+	}
+
+	if redeemReq.Points <= 0 {
+		c.JSON(400, gin.H{
+			"error": "Invalid request",
+		})
+		return
+	}
+	circleIdRaw := c.Param("id")
+
+	circleID, err := strconv.Atoi(circleIdRaw)
+	if err != nil {
+		log.Error("Error redeeming points: invalid circle id")
+		c.JSON(400, gin.H{
+			"error": "Invalid request: invalid circle id",
+		})
+		return
+	}
+	if circleID != currentUser.CircleID {
+		log.Error("You are not a member of this circle")
+		c.JSON(400, gin.H{
+			"error": "You are not a member of this circle",
+		})
+		return
+	}
+	members, err := h.circleRepo.GetCircleUsers(c, currentUser.CircleID)
+	if err != nil {
+		log.Error("Error getting circle admins:", err)
+		c.JSON(500, gin.H{
+			"error": "Error getting circle admins",
+		})
+		return
+	}
+	isAdmin := false
+	isValidMember := false
+	var member *cModel.UserCircleDetail
+	for _, user := range members {
+		if user.UserID == currentUser.ID && user.Role == "admin" {
+			isAdmin = true
+		}
+		if user.UserID == redeemReq.UserID {
+			isValidMember = true
+			member = user
+		}
+
+	}
+
+	if !isAdmin {
+		log.Error("Error redeeming points: user is not an admin of this circle")
+		c.JSON(403, gin.H{
+			"error": "You are not an admin of this circle",
+		})
+		return
+	}
+	if !isValidMember {
+		log.Error("Error redeeming points: user is not a member of this circle")
+		c.JSON(400, gin.H{
+			"error": "User is not a member of this circle",
+		})
+		return
+	}
+	if member.Points-redeemReq.Points < 0 {
+		log.Error("Error redeeming points: user does not have enough points")
+		c.JSON(400, gin.H{
+			"error": "User does not have enough points",
+		})
+		return
+	}
+
+	err = h.circleRepo.RedeemPoints(c, currentUser.CircleID, redeemReq.UserID, redeemReq.Points, currentUser.ID)
+	if err != nil {
+		log.Error("Error redeeming points:", err)
+		c.JSON(500, gin.H{
+			"error": "Error redeeming points",
+		})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"res": "Points redeemed successfully",
+	})
+}
+func (h *Handler) ChangeMemberRole(c *gin.Context) {
+	log := logging.FromContext(c)
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(500, gin.H{
+			"error": "Error getting current user",
+		})
+		return
+	}
+	type changeRoleRequest struct {
+		MemberID int         `json:"memberId"`
+		Role     cModel.Role `json:"role"`
+	}
+	var req changeRoleRequest
+	if err := c.ShouldBind(&req); err != nil {
+		log.Error("Error changing member role:", err)
+		c.JSON(400, gin.H{
+			"error": "Invalid request",
+		})
+		return
+	}
+
+	if !cModel.IsValidRole(req.Role) {
+		log.Error("Error changing member role: invalid role")
+		c.JSON(400, gin.H{
+			"error": "Invalid role",
+		})
+		return
+	}
+
+	users, err := h.circleRepo.GetCircleUsers(c, currentUser.CircleID)
+	if err != nil {
+		log.Error("Error getting circle admins:", err)
+		c.JSON(500, gin.H{
+			"error": "Error getting circle admins",
+		})
+		return
+	}
+	isAdmin := false
+	memberFound := false
+	adminCount := 0
+	for _, user := range users {
+		if user.Role == "admin" {
+			adminCount++
+			if user.UserID == currentUser.ID {
+				isAdmin = true
+			}
+		}
+		if user.UserID == req.MemberID {
+			memberFound = true
+		}
+	}
+	if !isAdmin {
+		c.JSON(403, gin.H{
+			"error": "You are not an admin of this circle",
+		})
+		return
+	}
+	if !memberFound {
+		c.JSON(400, gin.H{
+			"error": "User is not a member of this circle",
+		})
+		return
+	}
+
+	err = h.circleRepo.ChangeUserRole(c, currentUser.CircleID, req.MemberID, req.Role)
+	if err != nil {
+		log.Error("Error changing member role:", err)
+		c.JSON(500, gin.H{
+			"error": "Error changing member role",
+		})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"res": "Member role changed successfully",
+	})
+
 }
 
 func Routes(router *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 	log.Println("Registering routes")
 
-	circleRoutes := router.Group("circles")
+	circleRoutes := router.Group("api/v1/circles")
 	circleRoutes.Use(auth.MiddlewareFunc())
 	{
 		circleRoutes.GET("/members", h.GetCircleMembers)
 		circleRoutes.GET("/members/requests", h.GetPendingCircleMembers)
 		circleRoutes.PUT("/members/requests/accept", h.AcceptJoinRequest)
+		circleRoutes.PUT("/members/role", h.ChangeMemberRole)
 		circleRoutes.GET("/", h.GetUserCircles)
 		circleRoutes.POST("/join", h.JoinCircle)
 		circleRoutes.DELETE("/leave", h.LeaveCircle)
 		circleRoutes.DELETE("/:id/members/delete", h.DeleteCircleMember)
+		circleRoutes.POST("/:id/members/points/redeem", h.RedeemPoints)
 
 	}
 

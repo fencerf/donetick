@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"donetick.com/core/config"
+	"donetick.com/core/internal/auth"
+	authMiddleware "donetick.com/core/internal/auth"
 	chRepo "donetick.com/core/internal/chore/repo"
 	cRepo "donetick.com/core/internal/circle/repo"
 	tModel "donetick.com/core/internal/thing/model"
@@ -16,7 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Webhook struct {
+type API struct {
 	choreRepo  *chRepo.ChoreRepository
 	circleRepo *cRepo.CircleRepository
 	thingRepo  *tRepo.ThingRepository
@@ -24,9 +26,9 @@ type Webhook struct {
 	tRepo      *tRepo.ThingRepository
 }
 
-func NewWebhook(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository,
-	thingRepo *tRepo.ThingRepository, userRepo *uRepo.UserRepository, tRepo *tRepo.ThingRepository) *Webhook {
-	return &Webhook{
+func NewAPI(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository,
+	thingRepo *tRepo.ThingRepository, userRepo *uRepo.UserRepository, tRepo *tRepo.ThingRepository) *API {
+	return &API{
 		choreRepo:  cr,
 		circleRepo: circleRepo,
 		thingRepo:  thingRepo,
@@ -35,7 +37,7 @@ func NewWebhook(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository,
 	}
 }
 
-func (h *Webhook) UpdateThingState(c *gin.Context) {
+func (h *API) UpdateThingState(c *gin.Context) {
 	thing, shouldReturn := validateUserAndThing(c, h)
 	if shouldReturn {
 		return
@@ -60,7 +62,7 @@ func (h *Webhook) UpdateThingState(c *gin.Context) {
 	c.JSON(200, gin.H{})
 }
 
-func (h *Webhook) ChangeThingState(c *gin.Context) {
+func (h *API) ChangeThingState(c *gin.Context) {
 	thing, shouldReturn := validateUserAndThing(c, h)
 	if shouldReturn {
 		return
@@ -109,7 +111,7 @@ func (h *Webhook) ChangeThingState(c *gin.Context) {
 	c.JSON(200, gin.H{"state": thing.State})
 }
 
-func WebhookEvaluateTriggerAndScheduleDueDate(h *Webhook, c *gin.Context, thing *tModel.Thing) bool {
+func WebhookEvaluateTriggerAndScheduleDueDate(h *API, c *gin.Context, thing *tModel.Thing) bool {
 	// handler should be interface to not duplicate both WebhookEvaluateTriggerAndScheduleDueDate and EvaluateTriggerAndScheduleDueDate
 	// this is bad code written Saturday at 2:25 AM
 
@@ -134,22 +136,13 @@ func WebhookEvaluateTriggerAndScheduleDueDate(h *Webhook, c *gin.Context, thing 
 	return false
 }
 
-func validateUserAndThing(c *gin.Context, h *Webhook) (*tModel.Thing, bool) {
-	apiToken := c.GetHeader("secretkey")
-	if apiToken == "" {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return nil, true
-	}
+func validateUserAndThing(c *gin.Context, h *API) (*tModel.Thing, bool) {
 	thingID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return nil, true
 	}
-	user, err := h.userRepo.GetUserByToken(c, apiToken)
-	if err != nil {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return nil, true
-	}
+	user := auth.MustCurrentUser(c)
 	thing, err := h.thingRepo.GetThingByID(c, thingID)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Invalid thing id"})
@@ -162,14 +155,39 @@ func validateUserAndThing(c *gin.Context, h *Webhook) (*tModel.Thing, bool) {
 	return thing, false
 }
 
-func Webhooks(cfg *config.Config, w *Webhook, r *gin.Engine, auth *jwt.GinJWTMiddleware) {
+func APIs(cfg *config.Config, w *API, r *gin.Engine, auth *jwt.GinJWTMiddleware, userRepo *uRepo.UserRepository) {
 
-	thingsAPI := r.Group("webhooks/things")
+	thingsAPI := r.Group("eapi/v1/things")
 
-	thingsAPI.Use(utils.TimeoutMiddleware(cfg.Server.WriteTimeout))
+	thingsAPI.Use(
+		utils.TimeoutMiddleware(cfg.Server.WriteTimeout),
+		authMiddleware.APITokenMiddleware(userRepo),
+	)
 	{
 		thingsAPI.GET("/:id/state/change", w.ChangeThingState)
 		thingsAPI.GET("/:id/state", w.UpdateThingState)
+		thingsAPI.GET("/:id", w.GetThingByID)
+		thingsAPI.GET("/", w.GetAllThings)
 	}
 
+}
+
+// GetThingByID returns a single thing by its ID for the authenticated user
+func (h *API) GetThingByID(c *gin.Context) {
+	thing, shouldReturn := validateUserAndThing(c, h)
+	if shouldReturn {
+		return
+	}
+	c.JSON(200, gin.H{"thing": thing})
+}
+
+// GetAllThings returns all things for the authenticated user
+func (h *API) GetAllThings(c *gin.Context) {
+	user := auth.MustCurrentUser(c)
+	things, err := h.thingRepo.GetThingsByUserID(c, user.ID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, things)
 }

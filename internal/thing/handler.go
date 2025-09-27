@@ -4,9 +4,10 @@ import (
 	"strconv"
 	"time"
 
-	auth "donetick.com/core/internal/authorization"
+	auth "donetick.com/core/internal/auth"
 	chRepo "donetick.com/core/internal/chore/repo"
 	cRepo "donetick.com/core/internal/circle/repo"
+	"donetick.com/core/internal/events"
 	nRepo "donetick.com/core/internal/notifier/repo"
 	nps "donetick.com/core/internal/notifier/service"
 	tModel "donetick.com/core/internal/thing/model"
@@ -17,11 +18,12 @@ import (
 )
 
 type Handler struct {
-	choreRepo  *chRepo.ChoreRepository
-	circleRepo *cRepo.CircleRepository
-	nPlanner   *nps.NotificationPlanner
-	nRepo      *nRepo.NotificationRepository
-	tRepo      *tRepo.ThingRepository
+	choreRepo      *chRepo.ChoreRepository
+	circleRepo     *cRepo.CircleRepository
+	nPlanner       *nps.NotificationPlanner
+	nRepo          *nRepo.NotificationRepository
+	tRepo          *tRepo.ThingRepository
+	eventsProducer *events.EventsProducer
 }
 
 type ThingRequest struct {
@@ -32,13 +34,14 @@ type ThingRequest struct {
 }
 
 func NewHandler(cr *chRepo.ChoreRepository, circleRepo *cRepo.CircleRepository,
-	np *nps.NotificationPlanner, nRepo *nRepo.NotificationRepository, tRepo *tRepo.ThingRepository) *Handler {
+	np *nps.NotificationPlanner, nRepo *nRepo.NotificationRepository, tRepo *tRepo.ThingRepository, eventsProducer *events.EventsProducer) *Handler {
 	return &Handler{
-		choreRepo:  cr,
-		circleRepo: circleRepo,
-		nPlanner:   np,
-		nRepo:      nRepo,
-		tRepo:      tRepo,
+		choreRepo:      cr,
+		circleRepo:     circleRepo,
+		nPlanner:       np,
+		nRepo:          nRepo,
+		tRepo:          tRepo,
+		eventsProducer: eventsProducer,
 	}
 }
 
@@ -95,6 +98,7 @@ func (h *Handler) UpdateThingState(c *gin.Context) {
 		return
 	}
 	thing, err := h.tRepo.GetThingByID(c, thingID)
+	old_state := thing.State
 	if thing.UserID != currentUser.ID {
 		c.JSON(403, gin.H{"error": "Forbidden"})
 		return
@@ -118,6 +122,13 @@ func (h *Handler) UpdateThingState(c *gin.Context) {
 	if shouldReturn {
 		return
 	}
+	h.eventsProducer.ThingsUpdated(c.Request.Context(), currentUser.WebhookURL, map[string]interface{}{
+		"id":         thing.ID,
+		"name":       thing.Name,
+		"type":       thing.Type,
+		"from_state": old_state,
+		"to_state":   val,
+	})
 
 	c.JSON(200, gin.H{
 		"res": thing,
@@ -133,7 +144,11 @@ func EvaluateTriggerAndScheduleDueDate(h *Handler, c *gin.Context, thing *tModel
 	for _, tc := range thingChores {
 		triggered := EvaluateThingChore(tc, thing.State)
 		if triggered {
-			h.choreRepo.SetDueDateIfNotExisted(c, tc.ChoreID, time.Now().UTC())
+			err := h.choreRepo.SetDueDateIfNotExisted(c, tc.ChoreID, time.Now().UTC())
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return true
+			}
 		}
 	}
 	return false
@@ -279,7 +294,7 @@ func (h *Handler) DeleteThing(c *gin.Context) {
 }
 func Routes(r *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 
-	thingRoutes := r.Group("things")
+	thingRoutes := r.Group("api/v1/things")
 	thingRoutes.Use(auth.MiddlewareFunc())
 	{
 		thingRoutes.POST("", h.CreateThing)

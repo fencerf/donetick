@@ -3,7 +3,7 @@ package label
 import (
 	"strconv"
 
-	auth "donetick.com/core/internal/authorization"
+	auth "donetick.com/core/internal/auth"
 	lModel "donetick.com/core/internal/label/model"
 	lRepo "donetick.com/core/internal/label/repo"
 	jwt "github.com/appleboy/gin-jwt/v2"
@@ -164,7 +164,7 @@ func (h *Handler) deleteLabel(c *gin.Context) {
 
 func Routes(r *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 
-	labelRoutes := r.Group("labels")
+	labelRoutes := r.Group("api/v1/labels")
 	labelRoutes.Use(auth.MiddlewareFunc())
 	{
 		labelRoutes.GET("", h.getLabels)

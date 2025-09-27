@@ -6,6 +6,7 @@ WORKDIR /usr/src/app
 RUN apk --no-cache add curl jq
 
 RUN latest_release=$(curl --silent "https://api.github.com/repos/donetick/donetick/releases/latest" | jq -r .tag_name) && \
+
 curl -fL "https://github.com/fencerf/donetick/releases/download/${latest_release}/donetick_Linux_x86_64.tar.gz" | tar -xz -C .
 
 # Stage 2: Create a smaller runtime image

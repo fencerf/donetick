@@ -7,6 +7,7 @@ import (
 
 	"donetick.com/core/config"
 	chRepo "donetick.com/core/internal/chore/repo"
+	"donetick.com/core/internal/events"
 	nRepo "donetick.com/core/internal/notifier/repo"
 	uRepo "donetick.com/core/internal/user/repo"
 	"donetick.com/core/logging"
@@ -23,17 +24,19 @@ type Scheduler struct {
 	userRepo         *uRepo.UserRepository
 	stopChan         chan bool
 	notifier         *Notifier
+	eventsProducer   *events.EventsProducer
 	notificationRepo *nRepo.NotificationRepository
 	SchedulerJobs    config.SchedulerConfig
 }
 
-func NewScheduler(cfg *config.Config, ur *uRepo.UserRepository, cr *chRepo.ChoreRepository, n *Notifier, nr *nRepo.NotificationRepository) *Scheduler {
+func NewScheduler(cfg *config.Config, ur *uRepo.UserRepository, cr *chRepo.ChoreRepository, n *Notifier, nr *nRepo.NotificationRepository, ep *events.EventsProducer) *Scheduler {
 	return &Scheduler{
 		choreRepo:        cr,
 		userRepo:         ur,
 		stopChan:         make(chan bool),
 		notifier:         n,
 		notificationRepo: nr,
+		eventsProducer:   ep,
 		SchedulerJobs:    cfg.SchedulerJobs,
 	}
 }
@@ -58,7 +61,7 @@ func (s *Scheduler) cleanupSentNotifications(c context.Context) (time.Duration, 
 func (s *Scheduler) loadAndSendNotificationJob(c context.Context) (time.Duration, error) {
 	log := logging.FromContext(c)
 	startTime := time.Now()
-	getAllPendingNotifications, err := s.notificationRepo.GetPendingNotificaiton(c, time.Minute*900)
+	getAllPendingNotifications, err := s.notificationRepo.GetPendingNotification(c, time.Minute*900)
 	log.Debug("Getting pending notifications", " count ", len(getAllPendingNotifications))
 
 	if err != nil {
@@ -72,6 +75,11 @@ func (s *Scheduler) loadAndSendNotificationJob(c context.Context) (time.Duration
 			log.Error("Error sending notification", err)
 			continue
 		}
+		if notification.RawEvent != nil && notification.WebhookURL != nil {
+			// if we have a webhook url, we should send the event to the webhook
+			s.eventsProducer.NotificationEvent(c, *notification.WebhookURL, notification.RawEvent)
+		}
+
 		notification.IsSent = true
 	}
 
